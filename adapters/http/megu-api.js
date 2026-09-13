@@ -988,6 +988,13 @@ function router(deps = {}) {
 		}
 	});
 
+	api.get('/projects/join/:token', requireAccount, async (req,res,next) => {
+		res.set('Cache-Control', 'no-store');
+		try {
+			res.json(await projects.getProjectJoinStatus(req.params.token, req.actor.userId));
+		} catch(error) { if (!failProject(res,error)) next(error); }
+	});
+
 	api.post('/projects/join/:token', requireAccount, async (req,res,next) => {
 		try {
 			projects.validate.assertKnownFields(req.body || {}, []);
@@ -2411,6 +2418,13 @@ function router(deps = {}) {
 	});
 
 	api.use((err, req, res, next) => {
+		if (req.route?.path === '/projects/join/:token') {
+			// Neither the URL token nor provider/DB error text belongs in logs or UI.
+			log('Megu', `${req.method} /projects/join/:token → unavailable`);
+			if (res.headersSent) return next(err);
+			res.set('Cache-Control', 'no-store');
+			return fail(res, 503, 'join_unavailable');
+		}
 		log('Megu', `${req.method} ${req.originalUrl} → ${err.message}`);
 		if (res.headersSent) return next(err);
 		// PostgreSQL messages name tables, columns and constraints. They are

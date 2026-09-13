@@ -1320,18 +1320,35 @@ async function revokeJoinLink(code, actorUserId) {
 	});
 }
 
+async function readProjectJoinState(client, token, actorUserId, lock = false) {
+	const hash = invitationHash(requiredText(token, 'invitation_token', 200));
+	const found = await client.query('SELECT p.* FROM projects p JOIN project_join_links l ON l.project_id=p.id WHERE l.token_hash=$1' + (lock ? ' FOR UPDATE OF p' : ''), [hash]);
+	const project = found.rows[0];
+	if (!project) throw codedError('invitation_not_found');
+	const member = await client.query('SELECT 1 FROM project_memberships WHERE project_id=$1 AND user_id=$2 AND revoked_at IS NULL', [project.id, actorUserId]);
+	if (member.rows[0]) return { project, result: { status: 'approved', project: { code: project.code } } };
+	const existing = await client.query('SELECT status FROM project_join_requests WHERE project_id=$1 AND user_id=$2', [project.id, actorUserId]);
+	if (existing.rows[0]) {
+		// An old approval is history, not permission to restore revoked membership.
+		const status = existing.rows[0].status === 'approved' ? 'removed' : existing.rows[0].status;
+		return { project, result: { status } };
+	}
+	// Expiry/replacement blocks NEW requests, not reading one's existing status.
+	const valid = await client.query('SELECT 1 FROM project_join_links WHERE token_hash=$1 AND revoked_at IS NULL AND expires_at>now()', [hash]);
+	if (!valid.rows[0]) throw codedError('invitation_expired');
+	if (['completed', 'cancelled'].includes(project.status)) throw codedError('project_closed');
+	return { project, result: { status: 'eligible' } };
+}
+
+async function getProjectJoinStatus(token, actorUserId) {
+	const { result } = await readProjectJoinState({ query }, token, actorUserId);
+	return result;
+}
+
 async function requestProjectJoin(token, actorUserId) {
 	return transaction(async client => {
-		const found = await client.query('SELECT p.* FROM projects p JOIN project_join_links l ON l.project_id=p.id WHERE l.token_hash=$1 FOR UPDATE OF p', [invitationHash(requiredText(token, 'invitation_token', 200))]);
-		const project = found.rows[0];
-		if (!project) throw codedError('invitation_not_found');
-		const valid = await client.query('SELECT 1 FROM project_join_links WHERE token_hash=$1 AND revoked_at IS NULL AND expires_at>now()', [invitationHash(token)]);
-		if (!valid.rows[0]) throw codedError('invitation_expired');
-		if (['completed', 'cancelled'].includes(project.status)) throw codedError('project_closed');
-		const member = await client.query('SELECT 1 FROM project_memberships WHERE project_id=$1 AND user_id=$2 AND revoked_at IS NULL', [project.id,actorUserId]);
-		if (member.rows[0]) return { status: 'approved', project: { code: project.code } };
-		const existing = await client.query('SELECT status FROM project_join_requests WHERE project_id=$1 AND user_id=$2', [project.id,actorUserId]);
-		if (existing.rows[0]) return { status: existing.rows[0].status };
+		const { project, result } = await readProjectJoinState(client, token, actorUserId, true);
+		if (result.status !== 'eligible') return result;
 		const count = await client.query("SELECT count(*)::int AS n FROM project_join_requests WHERE project_id=$1 AND status='pending'", [project.id]);
 		if (count.rows[0].n >= 200) throw codedError('member_limit');
 		await client.query('INSERT INTO project_join_requests (id,project_id,user_id) VALUES ($1,$2,$3)', [newId('pjr'),project.id,actorUserId]);
@@ -1379,7 +1396,7 @@ async function reviewJoinRequest(code, requestId, actorUserId, input = {}) {
 }
 
 module.exports = {
-	createJoinLink, revokeJoinLink, requestProjectJoin, listJoinRequests, reviewJoinRequest,
+	createJoinLink, revokeJoinLink, getProjectJoinStatus, requestProjectJoin, listJoinRequests, reviewJoinRequest,
 	PROJECT_STATES, PROJECT_TRANSITIONS, ROLES, createProject, listProjectsForUser, listProjectDirectory,
 	getProjectByCode, listProjectTopics, getProjectTopic, createTopic, reportProgress, reviewTopic, setProjectState,
 	listProjectMembers, listProjectInvitations, createInvitation, revokeInvitation, acceptInvitation,

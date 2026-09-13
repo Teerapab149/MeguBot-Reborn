@@ -16,6 +16,46 @@
 // here is about which listener is allowed to advance the queue.
 require('dotenv').config();
 const assert = require('node:assert');
+
+// `audio_queue.js` lazily requires the legacy database adapter from queue
+// operations. Seed both boundaries before loading it: direct invocation also
+// loads .env, and a configured DATABASE_URL must never turn this offline test
+// into a database client. The call log below proves the queue still reports
+// the persistence event it is expected to report.
+const legacyDatabasePath = require.resolve('../backend/database/database.js');
+const legacyCalls = {
+	logAudioEvent: [],
+	updateAudioStatus: [],
+};
+require.cache[legacyDatabasePath] = {
+	id: legacyDatabasePath,
+	filename: legacyDatabasePath,
+	loaded: true,
+	exports: {
+		logAudioEvent(payload) {
+			legacyCalls.logAudioEvent.push(payload);
+			return Promise.resolve();
+		},
+		updateAudioStatus(...args) {
+			legacyCalls.updateAudioStatus.push(args);
+			return Promise.resolve();
+		},
+	},
+};
+
+// The bot logger performs a date check at module load and can update the
+// checkout's local config. Silence that unrelated side effect for this test.
+const botFunctionsPath = require.resolve('../backend/bot/bot_functions.js');
+require.cache[botFunctionsPath] = {
+	id: botFunctionsPath,
+	filename: botFunctionsPath,
+	loaded: true,
+	exports: {
+		BotLogs() {},
+		COLOR: new Proxy({}, { get: () => '' }),
+	},
+};
+
 const { AudioQueueManager } = require('../backend/bot/audio_queue.js');
 
 let n = 0;
@@ -79,6 +119,8 @@ function main() {
 
 		assert.strictEqual(manager.busy.has('guild-d'), false, 'clearQueue must release the busy flag');
 		assert.strictEqual(manager.getQueue('guild-d').length, 0, 'clearQueue must empty the queue');
+		assert.deepStrictEqual(legacyCalls.updateAudioStatus, [['1', 'CLEARED']],
+			'clearing a queue must persist the expected status through the injected adapter');
 		ok('clearing a queue does not leave the guild permanently mute');
 	}
 

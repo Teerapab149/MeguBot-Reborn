@@ -40,13 +40,17 @@ export default function ProjectManage({ code }) {
 	const [pendingNavigation, setPendingNavigation] = useState(null);
 
 	const readError = useCallback(problem => p.errors[problem?.code] || p.errors.failed, [p.errors]);
-	const load = useCallback(async () => {
-		setLoading(true); setError('');
+	const load = useCallback(async ({ quiet = false } = {}) => {
+		if (!quiet) setLoading(true);
+		setError('');
 		try {
 			const response = await fetch(`/api/megu/projects/${encodeURIComponent(code)}`, { credentials: 'same-origin' });
-			if (response.status === 401) { setSignedOut(true); return; }
+			if (response.status === 401) { setSignedOut(true); setData(null); return; }
 			const body = await response.json();
-			if (!response.ok) throw body;
+			if (!response.ok) {
+				if (response.status === 403 || response.status === 404) setData(null);
+				throw body;
+			}
 			setData(body);
 		}
 		catch (problem) { setError(readError(problem)); }
@@ -89,7 +93,7 @@ export default function ProjectManage({ code }) {
 			</nav>
 			<section className={styles.content}>
 				{tab === 'general' && <General project={project} me={me} p={p} lang={lang} readError={readError} onChanged={load} onDirtyChange={setDirty} />}
-				{tab === 'people' && <People project={project} members={members} me={me} p={p} lang={lang} readError={readError} onChanged={load} setError={setError} />}
+				{tab === 'people' && <People project={project} members={members} me={me} p={p} lang={lang} readError={readError} onChanged={() => load({ quiet: true })} setError={setError} />}
 				{tab === 'notifications' && <NotificationSettings project={project} me={me} initial={data.notificationSettings} p={p} readError={readError} onChanged={load} onDirtyChange={setDirty} />}
 				{tab === 'lifecycle' && <Lifecycle project={project} members={members} transfer={data.ownershipTransfer} me={me} p={p} readError={readError} onChanged={load} />}
 			</section>
@@ -196,7 +200,7 @@ function People({ project, members, me, p, lang, readError, onChanged, setError 
 			const roleOptions = ['member', 'viewer', ...(me.role === 'owner' ? ['lead'] : [])].map(role => ({ value: role, label: p.role[role] }));
 			return <div className={styles.member} key={member.userId}><ProjectAvatar name={member.displayName} avatarUrl={member.avatarUrl} className={styles.avatar} /><div><strong>{member.displayName}</strong><small>{p.memberSince} {dateLabel(member.joinedAt, lang, project.timezone) || '—'}</small></div>{mayManage ? <CustomSelect className={styles.memberSelect} size="compact" searchable={false} value={member.role} onChange={role => changeRole(member, role)} ariaLabel={`${member.displayName} ${p.inviteRole}`} options={roleOptions} /> : <span className={styles.role}>{p.role[member.role]}</span>}{!owner && (mayManage || member.userId === me.userId) && <button type="button" className={styles.iconButton} onClick={() => remove(member)} aria-label={member.userId === me.userId ? p.leaveProject : `${p.removeMember} ${member.displayName}`}><Trash2 size={16} /></button>}</div>;
 		})}</div>
-		{me.role === 'owner' && <ProjectJoinSettings code={project.code} p={p} onChanged={onChanged} />}
+		{me.role === 'owner' && <ProjectJoinSettings key={project.code} code={project.code} timezone={project.timezone} lang={lang} p={p} onChanged={onChanged} />}
 	</section>;
 }
 

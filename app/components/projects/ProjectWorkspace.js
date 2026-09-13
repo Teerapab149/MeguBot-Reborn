@@ -12,6 +12,7 @@ import ProjectTopicFilters from './ProjectTopicFilters';
 import CustomSelect from '../CustomSelect';
 import { useCopy } from '../../copy';
 import { deriveProjectTopicFilters, deriveReportableTopics, normalizeTopicQuery, parseProjectFilterParams, writeProjectFilterParams } from './projectFilters.mjs';
+import { createReportSubmission, sendReportRequest } from './reportSubmission.mjs';
 import styles from './projectWorkspace.module.css';
 
 const DAY = 86_400_000;
@@ -127,9 +128,12 @@ export default function ProjectWorkspace({ code }) {
 		setError('');
 		try {
 			const response = await fetch(`/api/megu/projects/${encodeURIComponent(code)}`, { credentials: 'same-origin' });
-			if (response.status === 401) { setSignedOut(true); return; }
+			if (response.status === 401) { setSignedOut(true); setData(null); return false; }
 			const body = await response.json();
-			if (!response.ok) throw body;
+			if (!response.ok) {
+				if (response.status === 403 || response.status === 404) setData(null);
+				throw body;
+			}
 			setData(body);
 			setSelectedId(current => {
 				const linked = new URLSearchParams(window.location.search).get('topic');
@@ -138,8 +142,9 @@ export default function ProjectWorkspace({ code }) {
 				return body.topics.some(topic => topic.id === current) ? current : (body.topics.find(topic => topic.assignees.some(a => a.userId === body.me.userId))?.id || body.topics[0]?.id || null);
 			});
 		}
-		catch (problem) { setError(readError(problem)); }
+		catch (problem) { setError(readError(problem)); return false; }
 		finally { setLoading(false); setRefreshing(false); }
+		return true;
 	}, [code, readError]);
 
 	useEffect(() => {
@@ -330,7 +335,7 @@ export default function ProjectWorkspace({ code }) {
 					</div>
 				</div>
 
-				{selected && <TopicDetail key={selected.id} topic={selected} project={project} members={members} notificationSettings={data.notificationSettings} p={p} lang={lang} canLead={canLead} canReport={canReportSelected} reporting={reporting} setReporting={setReporting} readError={readError} shouldFocus={focusDetail} outsideFilters={selectedOutsideFilters} onClearFilters={clearTopicFilters} onClose={closeTopic} onReportSaved={async () => { setReporting(false); await load({ quiet: true }); setReportAnnouncement(p.reportSaved); }} onChanged={() => load({ quiet: true })} />}
+				{selected && <TopicDetail key={selected.id} topic={selected} project={project} members={members} notificationSettings={data.notificationSettings} p={p} lang={lang} canLead={canLead} canReport={canReportSelected} reporting={reporting} setReporting={setReporting} readError={readError} shouldFocus={focusDetail} outsideFilters={selectedOutsideFilters} onClearFilters={clearTopicFilters} onClose={closeTopic} onReportSaved={async () => { if (!await load({ quiet: true })) throw new Error('report_refresh_failed'); setReporting(false); setReportAnnouncement(p.reportSaved); }} onChanged={() => load({ quiet: true })} />}
 			</div>
 		</div>
 	);
@@ -694,37 +699,77 @@ function AssigneeForm({ topic, project, members, p, readError, onCancel, onSaved
 
 function ReportForm({ topic, project, notificationSettings, correctionOf, p, readError, onCancel, onSaved }) {
 	const [form, setForm] = useState({ progress: String(topic.progress), summary: '', requestReview: false, blocked: topic.blocked, blockerReason: topic.blockerReason || '', reason: '', notifyLeads: false });
+	const [baseline, setBaseline] = useState(topic);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState('');
 	const [preview, setPreview] = useState(false);
-	const idempotency = useRef(uuid());
-	const decreasing = Number(form.progress) < topic.progress;
-	const clearingBlocker = topic.blocked && !form.blocked;
+	const [outcome, setOutcome] = useState('idle');
+	const [conflict, setConflict] = useState(false);
+	const [latestLoaded, setLatestLoaded] = useState(false);
+	const submission = useRef(null);
+	if (!submission.current) submission.current = createReportSubmission({
+		makeKey: uuid,
+		send: body => sendReportRequest(`/api/megu/projects/${project.code}/topics/${topic.id}/reports`, body),
+	});
+	const uncertain = outcome === 'uncertain';
+	const locked = busy || uncertain || outcome === 'saved';
+	const decreasing = Number(form.progress) < baseline.progress;
+	const clearingBlocker = baseline.blocked && !form.blocked;
+	const newBlocker = form.blocked && !baseline.blocked;
+	const mayNotifyLeads = newBlocker && notificationSettings?.enabled && notificationSettings.dmEnabled !== false && notificationSettings.blockerNotifications;
+	const willNotifyChannel = newBlocker && notificationSettings?.enabled && notificationSettings.channelEnabled;
 	const resultingWorkflow = form.requestReview ? 'in_review' : Number(form.progress) === 0 ? 'not_started' : 'in_progress';
-	const set = (key, value) => { setPreview(false); setForm(current => ({ ...current, [key]: value })); };
+	const set = (key, value) => { if (locked) return; setPreview(false); setForm(current => ({ ...current, [key]: value })); };
+	const loadLatest = async () => {
+		if (busy || uncertain) return;
+		setBusy(true); setError('');
+		try {
+			const response = await fetch(`/api/megu/projects/${project.code}/topics/${topic.id}`, { credentials: 'same-origin', cache: 'no-store' });
+			const body = await response.json();
+			if (!response.ok) throw body;
+			setBaseline(body.topic); setLatestLoaded(true); setConflict(false); setPreview(false);
+		} catch (problem) { setError(readError(problem)); }
+		finally { setBusy(false); }
+	};
 	const submit = async event => {
-		event.preventDefault(); setError('');
+		event.preventDefault();
+		if (busy || conflict || baseline.workflow === 'completed' || baseline.archivedAt) return;
+		setError('');
 		if (!preview) { setPreview(true); return; }
 		setBusy(true);
 		try {
-			const response = await fetch(`/api/megu/projects/${project.code}/topics/${topic.id}/reports`, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...form, progress: Number(form.progress), correctionOfReportId: correctionOf?.id || null, expectedRevision: topic.revision, idempotencyKey: idempotency.current }) });
-			const body = await response.json(); if (!response.ok) throw body; await onSaved();
+			await submission.current.submit({ ...form, progress: Number(form.progress), notifyLeads: Boolean(form.notifyLeads && mayNotifyLeads), correctionOfReportId: correctionOf?.id || null, expectedRevision: baseline.revision });
+			setOutcome('saved');
+			await onSaved();
 		}
-		catch (problem) { setError(readError(problem)); setBusy(false); }
+		catch (problem) {
+			setOutcome(submission.current.status);
+			setConflict(problem?.code === 'revision_conflict');
+			setError(readError(problem));
+		}
+		finally { setBusy(false); }
 	};
 	return <form className={styles.reportForm} onSubmit={submit}>
-		<div className={styles.reportHeading}><div><h2 id="topic-detail-title">{p.reportTitle}</h2><p>{topic.title}</p></div><button type="button" onClick={onCancel} aria-label={p.cancel}><X size={18} /></button></div>
+		<div className={styles.reportHeading}><div><h2 id="topic-detail-title">{p.reportTitle}</h2><p>{topic.title}</p></div><button type="button" disabled={busy} onClick={onCancel} aria-label={p.cancel}><X size={18} /></button></div>
 		{correctionOf && <div className={styles.correctionNote}><strong>{p.correctingReport}</strong><p>{correctionOf.summary}</p></div>}
+		{latestLoaded && <section className={styles.reportPreview} role="status"><strong>{p.reportLatestLoaded}</strong><p>{baseline.progress}% · {p.workflow[baseline.workflow]}</p>{baseline.latestReport && <SafeProjectMarkdown>{baseline.latestReport.summary}</SafeProjectMarkdown>}{baseline.blocked && <small>{p.blockerReason}: {baseline.blockerReason}</small>}</section>}
+		<fieldset disabled={locked} className={styles.reportFields}>
 		<label className={styles.field}><span>{p.progressField}</span><input type="number" min="0" max="99" required value={form.progress} onChange={e => set('progress', e.target.value)} /></label>
 		<label className={styles.field}><span>{p.summary}</span><textarea autoFocus rows={4} required maxLength={4000} value={form.summary} onChange={e => set('summary', e.target.value)} placeholder={p.summaryPlaceholder} /></label>
 		{(decreasing || clearingBlocker) && <label className={styles.field}><span>{clearingBlocker ? p.clearBlockerReason : p.decreaseReason}</span><textarea rows={2} required maxLength={1000} value={form.reason} onChange={e => set('reason', e.target.value)} /></label>}
 		<label className={styles.option}><input type="checkbox" checked={form.requestReview} onChange={e => set('requestReview', e.target.checked)} /><span>{p.requestReview}</span></label>
 		<label className={styles.option}><input type="checkbox" checked={form.blocked} onChange={e => set('blocked', e.target.checked)} /><span>{p.blocker}</span></label>
 		{form.blocked && <label className={styles.field}><span>{p.blockerReason}</span><textarea rows={2} required maxLength={1000} value={form.blockerReason} onChange={e => set('blockerReason', e.target.value)} /></label>}
-		{form.blocked && !topic.blocked && notificationSettings?.enabled && notificationSettings?.blockerNotifications && <label className={styles.option}><input type="checkbox" checked={form.notifyLeads} onChange={e => set('notifyLeads', e.target.checked)} /><span>{p.notifyLeads}</span></label>}
+		{mayNotifyLeads && <label className={styles.option}><input type="checkbox" checked={form.notifyLeads} onChange={e => set('notifyLeads', e.target.checked)} /><span>{p.notifyLeads}</span></label>}
+		</fieldset>
+		{willNotifyChannel && <p role="note">{p.reportChannelNotice}</p>}
+		{(willNotifyChannel || (mayNotifyLeads && form.notifyLeads)) && <small>{p.reportDeliveryHint}</small>}
 		{preview && <section className={styles.reportPreview} aria-labelledby="report-preview-title"><strong id="report-preview-title">{p.reportPreview}</strong><dl><div><dt>{p.progressField}</dt><dd>{form.progress}%</dd></div><div><dt>{p.resultingState}</dt><dd><State value={resultingWorkflow} p={p} workflow blocked={form.blocked} /></dd></div></dl><SafeProjectMarkdown>{form.summary}</SafeProjectMarkdown>{form.blocked && <small>{p.blockerReason}: {form.blockerReason}</small>}</section>}
 		{error && <p className={styles.formError} role="alert">{error}</p>}
-		<div className={styles.formActions}><button type="button" className="btn btn-secondary" onClick={preview ? () => setPreview(false) : onCancel}>{preview ? p.editUpdate : p.cancel}</button><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? p.saving : preview ? p.submitReport : p.reviewUpdate}</button></div>
+		{uncertain && <p role="status">{p.reportOutcomeUnknown}</p>}
+		{conflict && <button type="button" className="btn btn-secondary" disabled={busy} onClick={loadLatest}>{p.reportLoadLatest}</button>}
+		{(baseline.workflow === 'completed' || baseline.archivedAt) && <p role="status">{p.reportNoLongerOpen}</p>}
+		<div className={styles.formActions}><button type="button" className="btn btn-secondary" disabled={locked} onClick={preview ? () => setPreview(false) : onCancel}>{preview ? p.editUpdate : p.cancel}</button><button type="submit" className="btn btn-primary" disabled={busy || conflict || baseline.workflow === 'completed' || Boolean(baseline.archivedAt)}>{busy ? p.saving : uncertain ? p.reportRetrySame : outcome === 'saved' ? p.reportRefreshSaved : preview ? p.submitReport : p.reviewUpdate}</button></div>
 	</form>;
 }
 

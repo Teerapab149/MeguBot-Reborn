@@ -15,12 +15,12 @@ async function main() {
 	const link = await projects.createJoinLink(project.code,'owner');
 	assert.ok(link.token.length >= 32);
 	assert.notEqual(calls[2].args[2],link.token,'Only token hash is stored');
-	setup([[project],[{}],[],[],[{n:0}],[]]);
+	setup([[project],[],[],[{}],[{n:0}],[]]);
 	assert.deepEqual(await projects.requestProjectJoin(link.token,'person'),{status:'pending'});
 	assert.ok(!calls.some(c => /INSERT INTO project_memberships/.test(c.sql)), 'Requesting must not grant access');
-	setup([[project],[{}],[],[{status:'pending'}]]);
+	setup([[project],[],[{status:'pending'}]]);
 	assert.deepEqual(await projects.requestProjectJoin(link.token,'person'),{status:'pending'});
-	setup([[project],[]]);
+	setup([[project],[],[],[]]);
 	await assert.rejects(projects.requestProjectJoin(link.token,'person'),{code:'invitation_expired'});
 	setup([[{...project,role:'lead'}]]);
 	await assert.rejects(projects.reviewJoinRequest(project.code,'r1','lead',{action:'approve'}),{code:'project_forbidden'});

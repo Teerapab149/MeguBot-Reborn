@@ -385,6 +385,7 @@
 .addTopicActions { grid-column: 1 / -1; justify-self: end; padding-top: .15rem; }
 
 .reportForm { display: grid; gap: .85rem; }
+.reportFields { display: grid; gap: .85rem; min-inline-size: 0; border: 0; margin: 0; padding: 0; }
 .reportHeading { align-items: flex-start; margin-bottom: .25rem; }
 .reportHeading p { margin: .2rem 0 0; color: var(--muted); }
 .reportPreview { display: grid; gap: .65rem; border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--line)); border-radius: var(--r-sm); padding: .8rem; background: var(--accent-soft); }
